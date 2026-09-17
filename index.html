@@ -393,13 +393,13 @@
     }).catch(err=>{ tfWasmLoadPromise = null; throw err; });
     return tfWasmLoadPromise;
   }
-  // 偵測WebGL是否為軟體模擬繪圖（如SwiftShader/llvmpipe，常見於無GPU的虛擬機/沙箱環境），
-  // 這類軟體渲染對CartoonGAN這種卷積網路常常比WASM還慢，優先偵測後跳過改用WASM
+  // 偵測WebGL是否為軟體模擬繪圖（如SwiftShader/llvmpipe，常見於無GPU的虛擬機/沙箱環境）。
+  // 只有WASM無法初始化、需要嘗試WebGL備援時才會用到此判斷。
   function isLikelySoftwareWebGL(){
     try{
       const c = document.createElement('canvas');
       const gl = c.getContext('webgl2') || c.getContext('webgl');
-      if(!gl) return true; // 完全沒有WebGL，一併視為需要跳過改走WASM
+      if(!gl) return true; // 完全沒有WebGL，略過此備援方式
       const dbg = gl.getExtension('WEBGL_debug_renderer_info');
       const renderer = String(dbg ? gl.getParameter(dbg.UNMASKED_RENDERER_WEBGL) : gl.getParameter(gl.RENDERER));
       return /swiftshader|llvmpipe|software|mesa offscreen/i.test(renderer);
@@ -407,26 +407,34 @@
   }
   const cartoonModelCache = {}; // styleKey -> tf.GraphModel（載入後快取，切換畫風不必重新下載）
   let tfBackendReadyPromise = null;
-  // 依序嘗試 WebGL（GPU加速，最快）→ WASM（CPU上的SIMD加速，多數裝置都夠快）→ 純JS CPU（相容性最好但非常慢，僅作最後手段），
-  // 避免讓tfjs內部的backend自動選擇邏輯，在某個backend初始化失敗時以未捕捉例外的方式中斷整個流程
+  async function activateTfBackend(name, timeoutMessage){
+    if(name === 'wasm') await ensureTfWasmBackendLoaded();
+    await withTimeout((async()=>{
+      const activated = await tf.setBackend(name);
+      if(!activated) throw new Error(`${name} backend 無法啟用`);
+      await tf.ready();
+    })(), SCRIPT_LOAD_TIMEOUT_MS, timeoutMessage);
+  }
+
+  // CartoonGAN優先使用WASM（CPU SIMD）：速度雖可能略慢於GPU，但不需編譯瀏覽器／顯示卡專屬shader，
+  // 可避開「Failed to link vertex and fragment shaders」等裝置相容性問題。
+  // 若WASM無法初始化，才依序嘗試真實GPU的WebGL，最後使用純JS CPU。
   function ensureTfBackendReady(){
     if(tfBackendReadyPromise) return tfBackendReadyPromise;
     tfBackendReadyPromise = (async () => {
+      try{
+        await activateTfBackend('wasm', 'WASM backend 初始化逾時');
+        return;
+      } catch(e){ console.warn('WASM backend 初始化失敗或逾時，改嘗試其他運算方式', e); }
       if(!isLikelySoftwareWebGL()){
         try{
-          await withTimeout((async()=>{ await tf.setBackend('webgl'); await tf.ready(); })(), SCRIPT_LOAD_TIMEOUT_MS, 'WebGL backend 初始化逾時');
+          await activateTfBackend('webgl', 'WebGL backend 初始化逾時');
           return;
-        } catch(e){ console.warn('WebGL backend 初始化失敗或逾時，改嘗試 WASM backend', e); }
+        } catch(e){ console.warn('WebGL backend 初始化失敗或逾時，改用純JS CPU backend（運算速度會非常慢）', e); }
       } else {
-        console.warn('偵測到軟體模擬WebGL（無真實GPU加速），改優先使用 WASM backend');
+        console.warn('偵測到軟體模擬WebGL（無真實GPU加速），直接改用純JS CPU backend');
       }
-      try{
-        await ensureTfWasmBackendLoaded();
-        await withTimeout((async()=>{ await tf.setBackend('wasm'); await tf.ready(); })(), SCRIPT_LOAD_TIMEOUT_MS, 'WASM backend 初始化逾時');
-        return;
-      } catch(e){ console.warn('WASM backend 初始化失敗或逾時，改用純JS CPU backend（運算速度會非常慢）', e); }
-      await tf.setBackend('cpu');
-      await tf.ready();
+      await activateTfBackend('cpu', 'CPU backend 初始化逾時');
     })();
     return tfBackendReadyPromise;
   }
@@ -474,9 +482,9 @@
   }
 
   // 對來源canvas執行CartoonGAN風格轉換：
-  // 1) 加上逾時保護（見ANIME_STYLIZE_TIMEOUT_MS），避免WebGL顯示卡驅動卡住/當機時無限期停在「處理中」卻無任何錯誤訊息
-  // 2) 長時間使用WebGL backend後，偶爾會因內部貼圖管理累積而觸發「Requested texture size ... greater than WebGL
-  //    maximum」錯誤；或WebGL執行本身逾時（很可能是顯示卡驅動卡住）；兩種情況都自動改用WASM backend重試一次
+  // 1) 加上逾時保護（見ANIME_STYLIZE_TIMEOUT_MS），避免運算卡住時無限期停在「處理中」。
+  // 2) 正常情況使用WASM，不會進入shader編譯；若先前WASM初始化失敗而使用WebGL備援，
+  //    任何貼圖、WebGL、shader、vertex／fragment或program link錯誤都會自動降級至WASM／CPU重試。
   async function runCartoonStylize(styleKey, srcCanvas, statusEl){
     const attempt = () => withTimeout(
       runCartoonStylizeOnce(styleKey, srcCanvas, statusEl),
@@ -487,16 +495,22 @@
       return await attempt();
     } catch(err){
       const msg = (err && err.message) || '';
-      const isRecoverable = /texture size|webgl|逾時/i.test(msg);
+      const isRecoverable = /texture size|webgl|shader|vertex|fragment|link(?:ed|ing)?\s+(?:a\s+)?program|program\s+link|逾時/i.test(msg);
       if(isRecoverable && tf.getBackend() === 'webgl'){
         console.warn('WebGL執行失敗或逾時，改用WASM backend重試一次', err);
         if(statusEl) statusEl.textContent = 'WebGL執行遇到問題，正在改用相容性較高的運算方式重試…';
-        await ensureTfWasmBackendLoaded();
-        await withTimeout((async()=>{ await tf.setBackend('wasm'); await tf.ready(); })(), SCRIPT_LOAD_TIMEOUT_MS, 'WASM backend 初始化逾時');
         try{
+          await activateTfBackend('wasm', 'WASM backend 初始化逾時');
           return await attempt();
         } catch(err2){
-          throw new Error((err2 && err2.message ? err2.message : String(err2)) + '（已嘗試改用WASM重試仍失敗，建議重新整理頁面後再試一次，或改用素描風模式）');
+          console.warn('WASM重試失敗，改用純JS CPU backend進行最後一次重試', err2);
+          if(statusEl) statusEl.textContent = '相容模式仍無法完成，正在使用CPU進行最後一次重試（速度較慢）…';
+          try{
+            await activateTfBackend('cpu', 'CPU backend 初始化逾時');
+            return await attempt();
+          } catch(err3){
+            throw new Error((err3 && err3.message ? err3.message : String(err3)) + '（已依序嘗試相容模式與CPU仍失敗，建議重新整理頁面後再試一次，或改用素描風模式）');
+          }
         }
       }
       throw err;
