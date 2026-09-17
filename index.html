@@ -281,7 +281,7 @@
       <label style="margin-top:8px;"><input type="checkbox" id="zipIncludeBoth" style="width:auto; display:inline-block; margin-right:6px;">打包下載時，同時包含另一種外層裝飾層模式的檔案</label>
       <button class="btn primary" id="dlZip" disabled>產生並打包下載全部檔案（ZIP）</button>
       <div class="statusLine" id="statusLine"></div>
-      <div class="note">「下載列印頁面」會把原始照片、灰階高度圖、外層裝飾層、C/M/Y三色版等所有列印用圖層，依實際輸出尺寸自動排版到儘量少的 A4 紙（210×297mm，600dpi，預留5mm列印邊界）上——同一張A4紙能放下幾張圖層就放幾張，超過則自動分到第2、3…頁，每張圖層左上角會標示名稱、四角皆有「十字線＋打孔圓點同心對位記號」，方便疊合裁切、打孔對位。可直接下載後用家用印表機列印（請於印表機設定選擇「實際尺寸／100%」，勿選擇縮放至頁面），列印後沿虛線裁切即為實際輸出尺寸。雷射雕刻專用灰階PNG維持原始尺寸單獨下載，不參與A4排版。所有圖層皆為依序產生、逐一釋放記憶體，避免一次性佔用過多瀏覽器記憶體。</div>
+      <div class="note">「下載列印頁面」會把原始照片、灰階高度圖、外層裝飾層、C/M/Y三色版等所有列印用圖層，依實際輸出尺寸自動排版到儘量少的 A4 紙（210×297mm，600dpi，預留5mm列印邊界）上——同一張A4紙能放下幾張圖層就放幾張，超過則自動分到第2、3…頁。A4 圖面不加入任何文字標籤，各圖層四角皆保留「十字線＋打孔圓點同心對位記號」，方便疊合裁切、打孔對位。可直接下載後用家用印表機列印（請於印表機設定選擇「實際尺寸／100%」，勿選擇縮放至頁面），列印後沿虛線裁切即為實際輸出尺寸。雷射雕刻專用灰階PNG維持原始尺寸單獨下載，不參與A4排版。所有圖層皆為依序產生、逐一釋放記憶體，避免一次性佔用過多瀏覽器記憶體。</div>
     </section>
 
     <section class="panel">
@@ -977,7 +977,9 @@
       bctx.drawImage(originalCanvas, 0, 0);
     }
     bctx.globalAlpha = Math.max(0, Math.min(100, intensity)) / 100;
-    bctx.drawImage(rawCanvas, 0, 0);
+    // 預覽快取只有約320px；下載時的targetW/targetH則是600dpi完整尺寸。
+    // 必須明確指定目的寬高，否則Canvas會按快取原始像素貼在左上角，造成日式似顏繪與雷射PNG只佔整張圖的一小塊。
+    bctx.drawImage(rawCanvas, 0, 0, targetW, targetH);
     bctx.globalAlpha = 1;
 
     if(brightness === 0 && contrast === 0 && saturation === 0) return blended;
@@ -1494,8 +1496,8 @@
     return c;
   }
 
-  // 把單一圖層畫入頁面canvas的指定網格位置，附上裁切虛線框與左上角名稱標籤
-  function drawItemOntoPage(pageCanvas, itemCanvas, label, wmm, hmm, xmm, ymm){
+  // 把單一圖層畫入頁面canvas的指定網格位置，只保留裁切虛線框，不加入任何文字標籤
+  function drawItemOntoPage(pageCanvas, itemCanvas, wmm, hmm, xmm, ymm){
     const ctx = pageCanvas.getContext('2d');
     const x = mmToPx(xmm, DPI), y = mmToPx(ymm, DPI);
     const w = mmToPx(wmm, DPI), h = mmToPx(hmm, DPI);
@@ -1505,17 +1507,6 @@
     ctx.lineWidth = Math.max(1, mmToPx(0.2, DPI));
     ctx.setLineDash([mmToPx(2,DPI), mmToPx(2,DPI)]);
     ctx.strokeRect(x, y, w, h);
-    ctx.restore();
-    ctx.save();
-    const fontPx = mmToPx(3.2, DPI);
-    ctx.font = `bold ${fontPx}px sans-serif`;
-    const textW = ctx.measureText(label).width;
-    const padX = mmToPx(1.2, DPI), padY = mmToPx(0.8, DPI);
-    ctx.fillStyle = 'rgba(20,22,26,0.78)';
-    ctx.fillRect(x, y, textW + padX*2, fontPx + padY*2);
-    ctx.fillStyle = '#fff';
-    ctx.textBaseline = 'top';
-    ctx.fillText(label, x + padX, y + padY);
     ctx.restore();
   }
 
@@ -1571,7 +1562,7 @@
       if(idxOnPage >= grid.perPage){ pages.push(curPage); startNewPage(); }
       const col = idxOnPage % grid.cols, row = Math.floor(idxOnPage / grid.cols);
       const xmm = grid.offXmm + col*wmm, ymm = grid.offYmm + row*hmm;
-      drawItemOntoPage(curPage, layerCanvas, jobs[i].label, wmm, hmm, xmm, ymm);
+      drawItemOntoPage(curPage, layerCanvas, wmm, hmm, xmm, ymm);
       idxOnPage++;
       layerCanvas.width = 0; layerCanvas.height = 0; // 盡快釋放來源圖層canvas佔用的記憶體
     }
@@ -1662,7 +1653,7 @@
 實際輸出尺寸：${wmm} x ${hmm} mm（600 DPI，${w} x ${h} px）
 
 檔案：
-- print-page-N.png：已自動排版於A4紙（210×297mm，600dpi）的列印頁面，同一張A4紙會依實際輸出尺寸儘量塞入多張圖層（原始照片、灰階高度圖、外層裝飾層、Cyan/Magenta/Yellow版），塞不下的圖層會依序排到下一頁；每張圖層左上角有名稱標籤，四角皆有「十字線＋打孔圓點」同心對位記號，並統一預留${A4_MARGIN_MM}mm列印邊界，可直接以家用印表機列印（請於印表機設定選擇「實際尺寸／100%」，不要選擇縮放至頁面），列印後沿虛線裁切即為實際輸出尺寸，各圖層比例與座標完全一致，方便疊合裁切、打孔對位。
+- print-page-N.png：已自動排版於A4紙（210×297mm，600dpi）的列印頁面，同一張A4紙會依實際輸出尺寸儘量塞入多張圖層（原始照片、灰階高度圖、外層裝飾層、Cyan/Magenta/Yellow版），塞不下的圖層會依序排到下一頁；圖面不含任何文字標籤，各圖層四角皆有「十字線＋打孔圓點」同心對位記號，並統一預留${A4_MARGIN_MM}mm列印邊界，可直接以家用印表機列印（請於印表機設定選擇「實際尺寸／100%」，不要選擇縮放至頁面），列印後沿虛線裁切即為實際輸出尺寸，各圖層比例與座標完全一致，方便疊合裁切、打孔對位。
 - lineart-anime-laser.png：日式似顏繪風格的雷射雕刻專用灰階點陣（亮度轉換，深色=雕更深，如與您軟體慣例相反請在下載前勾選反轉），維持原始輸出尺寸，不參與A4排版，供直接匯入雷射雕刻軟體使用。
 - lineart-sketch-laser.png：素描風的雷射雕刻專用灰階點陣，同上說明。
 
